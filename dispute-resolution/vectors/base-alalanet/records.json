@@ -4,7 +4,8 @@
   "inputs": {
     "input/cases.json": 10,
     "input/receipts": 3,
-    "input/chain-id.json": "eip155:8453"
+    "input/chain-id.json": "eip155:8453",
+    "input/fixtures.json": 4
   },
   "counts": {
     "cases": 10,
@@ -12,6 +13,7 @@
     "proposed_code_records": 3,
     "in_scope": 3,
     "pitfalls": 4,
+    "fixtures": 4,
     "jcs_cases_reproduced_by_make_mjs": 4
   },
   "records": [
@@ -397,6 +399,51 @@
       "jcs": "{\"evidence\":{\"delta\":[{\"actual\":\"0x833589fcd6edb6e08f4c7c32d4f71b54bda02913\",\"authorized\":[\"0xcb9b3f94387389e38ef2a7b3c0b851fb8325d7e9\"],\"field\":\"allow.pay_to\"}]},\"iat\":1794120000,\"reason\":\"audience-mismatch\",\"tier\":1}",
       "sha256_b64url": "IZ1YmCWPTyRchqJgqDu_J-VyH3kouJE27YpmnSvqUcs",
       "sha256_hex": "219d5898258f4f245c86a260a83bbf27e5721f7928b89136ed8a669d2bea51cb"
+    }
+  ],
+  "fixtures": [
+    {
+      "index": 0,
+      "name": "F1 B1 plus two unrelated transfers: 1 EURC unit from the payer, 1 USDC unit from the facilitator",
+      "tx": "0xbc7f261ab5b03d331934a27970466c2927f50c1831c880eb524aa2fe6ffa8928",
+      "added_logs": 2,
+      "verdict": "in_scope",
+      "payment": {
+        "network": "eip155:8453",
+        "asset": "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+        "payer": "0xe54bb381c683b9ae150f561778f0d7bdc1065876",
+        "to": "0xf8c639d3e47ab60ff96bcc144260f5d8bea344f6",
+        "amount": "2000",
+        "block_time": 1794044049
+      },
+      "same_event_as_recorded_receipt": true
+    },
+    {
+      "index": 1,
+      "name": "F2 B1 plus a second, identical USDC Transfer from the payer",
+      "tx": "0xbc7f261ab5b03d331934a27970466c2927f50c1831c880eb524aa2fe6ffa8928",
+      "added_logs": 1,
+      "verdict": "unchecked",
+      "cause": "payment_event",
+      "why": "payment event not determined: 2 Transfer logs of the token contract from the authorizer"
+    },
+    {
+      "index": 2,
+      "name": "F3 B1 with an allow-list entry one hex digit short (not an address)",
+      "tx": "0xbc7f261ab5b03d331934a27970466c2927f50c1831c880eb524aa2fe6ffa8928",
+      "added_logs": 0,
+      "verdict": "unchecked",
+      "cause": "invalid_value",
+      "why": "not a valid value for its predicate: allow.pay_to"
+    },
+    {
+      "index": 3,
+      "name": "F4 B1 with allow.resource_prefix, which the payment event does not carry",
+      "tx": "0xbc7f261ab5b03d331934a27970466c2927f50c1831c880eb524aa2fe6ffa8928",
+      "added_logs": 0,
+      "verdict": "unchecked",
+      "cause": "no_predicate",
+      "why": "no predicate for allow.resource_prefix"
     }
   ]
 }

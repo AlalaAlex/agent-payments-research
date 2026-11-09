@@ -27,7 +27,7 @@ Two choices follow the comments on #3500 and PR #3:
 
 How each value is read:
 
-- **The payment** is the one `Transfer(address,address,uint256)` log of the token contract plus the one EIP-3009 `AuthorizationUsed(address,bytes32)` log by the same payer. That is what `transferWithAuthorization` emits for an x402 `exact` payment on EVM. `make.mjs` stops if a receipt has anything else.
+- **The payment** is the one EIP-3009 `AuthorizationUsed(address,bytes32)` log plus the one `Transfer(address,address,uint256)` log of the same token contract from the same payer. That is what `transferWithAuthorization` emits for an x402 `exact` payment on EVM. Transfer logs of other contracts or senders are skipped. If this does not single out one event, the result is `unchecked`.
   - `actual` payee: topic 2 of the Transfer log.
   - `actual` amount: the log data, as a decimal string.
   - `actual` asset: the log's contract address.
@@ -36,6 +36,8 @@ How each value is read:
 - **`authorized`** is the value at `field` in the mandate (an allow-list stays an array).
 - **`currency`** is present for the amount only. It is the token contract address.
 - **EVM addresses are compared and recorded in lowercase.** See the first finding below.
+
+**Deciding a mismatch.** Each check in `make.mjs` (`CHECKS`) is the constraint's own predicate: `allow.pay_to` is membership, `per_payment_max` is `BigInt(amount) > BigInt(cap)`, `not_before` and `expires_at` bound the block time, `network` and `asset` are equality. It is not `authorized ≠ actual` (Step 4d as written). B1 and B3 use the same 2000-unit transfer: it differs from both caps (10000 and 1000), and only B3 is over its cap. In B2 the allow-list (an array) differs from the payee (a string), and the payee is allowed; B4 is the disallowed control. If the payment event or a predicate cannot be determined, the result is `unchecked` and there is no record (see Fixtures).
 
 ## Records
 
@@ -69,7 +71,20 @@ So the spec has to say how an EVM address appears in a record, and Step 4c ("the
 
 **2. The transaction's own fields are not the payment.** In x402 on EVM the facilitator sends the transaction. So `tx.from` is the facilitator's wallet, not the payer, and `tx.to` is the USDC contract, not the payee. A resolver that reads the payee from `tx.to` finds every payment out of scope. `pitfalls` (`payee_read_from_tx_to`) holds the wrong `audience-mismatch` record such a resolver would produce for B1, B2 and B10, with its hash, so that an implementation can test it does not produce it. The payer and the payee are in the Transfer log, and the payer is also the EIP-3009 authorizer.
 
-**3. One payment, one shape.** On Solana, `debit_not_x402` covers money that left the granted account some other way. On EVM the closest test is the receipt shape: exactly one Transfer and one AuthorizationUsed by the same payer, from the same token contract. These cases have no record for that. `make.mjs` refuses such a receipt instead.
+**3. One payment, one shape.** On Solana, `debit_not_x402` covers money that left the granted account some other way. On EVM the closest test is the receipt shape: exactly one AuthorizationUsed, and exactly one Transfer of the same token contract from the same payer. These cases have no record for that. A receipt without that shape gives `unchecked` (F2 below); Transfer logs of other contracts or senders are skipped (F1).
+
+## Fixtures (not on chain)
+
+`input/fixtures.json` holds four variants of B1 that are not on chain: logs appended to its recorded receipt, or a changed mandate. The recorded receipts and blocks are not modified. The fixtures produce no record; `records.json` lists their results under `fixtures`.
+
+| fixture | change to B1 | result |
+|---|---|---|
+| F1 | two unrelated Transfer logs added: 1 EURC unit from the payer, 1 USDC unit from the facilitator | `in_scope`, the same payment event as the recorded receipt |
+| F2 | a second, identical USDC Transfer from the payer | `unchecked` (`payment_event`) |
+| F3 | the allow-list entry is one hex digit short, so not an address | `unchecked` (`invalid_value`), not `audience-mismatch` |
+| F4 | `allow.resource_prefix` added; the payment event carries no resource | `unchecked` (`no_predicate`), not `in_scope` |
+
+F1 and F2 follow the review on PR #5. `unchecked` is the resolver's result, not an evidence record: the same split as `history_incomplete` in `../solana-iussum`.
 
 ## Cross-check of the serialisation
 
@@ -83,7 +98,7 @@ All three serialisers gave byte-identical output and the same SHA-256 for 11 of 
 
 ## Open questions
 
-1. EVM addresses in a record: lowercase (used here) or EIP-55? And should Step 4c say that the comparison uses the same normal form?
+1. EVM addresses in a record: lowercase (used here) or EIP-55? And should Step 4c say that the comparison uses the same normal form? Should Step 4d evaluate the field's constraint, as `make.mjs` does, instead of `authorized ≠ actual`, and return `unchecked` when the predicate or the payment event cannot be determined?
 2. `currency`: the contract address (used here), or a CAIP-19 id such as `eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913`? CAIP-19 would also carry the network, which a bare contract address does not.
 3. `network` values: CAIP-2 (`eip155:8453`), as in the iussum mandate, or the x402 v1 names (`base`, `base-sepolia`) some catalogues still use? A record that mixes them hashes differently for the same mismatch.
 4. `grant-not-yet-valid`: violated when the block time is before `not_before` (used here, like JWT `nbf`). And `grant-expired` when the block time is at or after `expires_at` (like JWT `exp`). Is the boundary second meant to be inclusive the same way on both?

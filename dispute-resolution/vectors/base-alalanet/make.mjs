@@ -6,6 +6,8 @@
 // ext-disputes.md section 5.6 canonical record { reason, tier, evidence: { delta: [ { field, authorized, actual, currency? } ] }, iat },
 // serialises it with JCS (RFC 8785) and hashes it with SHA-256 (base64url without padding, and hex). Every value comes from the
 // mandate, the receipt, the block or the case's explicit filing time. It stops if a case's result differs from what the case expects.
+// It also runs input/fixtures.json: variants of B1 that are not on chain (logs added to its recorded receipt, or a changed mandate).
+// They test which payment event is selected and when the result is `unchecked`; they produce no record.
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
@@ -36,20 +38,23 @@ const chainId = BigInt(read('./input/chain-id.json').result);
 const network = `eip155:${chainId}`;
 const topicAddr = (t) => `0x${t.slice(-40)}`.toLowerCase();
 
-function payment(tx) {
+function payment(tx, addLogs = []) {
   const r = read(`./input/receipts/${tx}.json`).result;
   if (r.status !== '0x1') throw new Error(`${tx}: transaction failed`);
   const b = read(`./input/blocks/${r.blockNumber}.json`).result;
   if (b.hash !== r.blockHash) throw new Error(`${tx}: block hash does not match the receipt`);
-  const transfers = r.logs.filter((l) => l.topics[0] === TRANSFER);
-  const auths = r.logs.filter((l) => l.topics[0] === EIP3009_USED);
-  // One x402 "exact" payment on EVM: transferWithAuthorization (EIP-3009) emits one Transfer from the payer and one
-  // AuthorizationUsed by the same payer, both from the token contract. Anything else is not one x402 payment.
-  if (transfers.length !== 1 || auths.length !== 1) throw new Error(`${tx}: not exactly one Transfer and one AuthorizationUsed`);
-  const t = transfers[0], a = auths[0];
-  if (t.address.toLowerCase() !== a.address.toLowerCase() || topicAddr(t.topics[1]) !== topicAddr(a.topics[1])) throw new Error(`${tx}: Transfer and AuthorizationUsed disagree`);
+  const logs = [...r.logs, ...addLogs];
+  // One x402 "exact" payment on EVM: transferWithAuthorization (EIP-3009) emits one AuthorizationUsed by the payer and one
+  // Transfer from the same payer, both from the token contract. Transfers of other contracts or senders are not the payment.
+  // If that does not single out one event, the payment event is not determined: `unchecked`, never a guess.
+  const auths = logs.filter((l) => l.topics[0] === EIP3009_USED);
+  if (auths.length !== 1) return { unchecked: `${auths.length} AuthorizationUsed logs` };
+  const token = auths[0].address.toLowerCase(), payer = topicAddr(auths[0].topics[1]);
+  const transfers = logs.filter((l) => l.topics[0] === TRANSFER && l.address.toLowerCase() === token && topicAddr(l.topics[1]) === payer);
+  if (transfers.length !== 1) return { unchecked: `${transfers.length} Transfer logs of the token contract from the authorizer` };
+  const t = transfers[0];
   return {
-    tx, network, asset: t.address.toLowerCase(), payer: topicAddr(t.topics[1]), to: topicAddr(t.topics[2]),
+    tx, network, asset: token, payer, to: topicAddr(t.topics[2]),
     amount: BigInt(t.data).toString(), time: Number(BigInt(b.timestamp)),
     // the transaction itself: sent by the facilitator, addressed to the token contract (see "Pitfalls")
     tx_from: r.from.toLowerCase(), tx_to: r.to.toLowerCase(),
@@ -57,17 +62,33 @@ function payment(tx) {
 }
 
 // ---- the mandate checks, in a fixed order. EVM addresses are compared and recorded in lowercase (see README).
+// `bad` is the constraint's own predicate (membership, BigInt cap, time bound, equality), never `authorized !== actual`:
+// B1 and B2 differ from their mandates and violate nothing. A value that is not valid for its predicate gives `unchecked`.
 const isAddr = (s) => typeof s === 'string' && /^0x[0-9a-fA-F]{40}$/.test(s);
+const isTime = (n) => Number.isSafeInteger(n) && n >= 0;
 const norm = (v) => (Array.isArray(v) ? v.map(norm) : isAddr(v) ? v.toLowerCase() : v);
 const at = (m, path) => path.split('.').reduce((o, k) => (o == null ? undefined : o[k]), m);
 const CHECKS = [
-  { field: 'network', code: 'network-mismatch', proposed: true, bad: (m, p) => m.network !== p.network, actual: (p) => p.network },
-  { field: 'asset', code: 'asset-mismatch', proposed: true, bad: (m, p) => norm(m.asset) !== p.asset, actual: (p) => p.asset },
-  { field: 'not_before', code: 'grant-not-yet-valid', proposed: true, bad: (m, p) => p.time < m.not_before, actual: (p) => p.time },
-  { field: 'expires_at', code: 'grant-expired', bad: (m, p) => p.time >= m.expires_at, actual: (p) => p.time },
-  { field: 'per_payment_max', code: 'scope-exceeded', bad: (m, p) => BigInt(p.amount) > BigInt(m.per_payment_max), actual: (p) => p.amount, currency: (p) => p.asset },
-  { field: 'allow.pay_to', code: 'audience-mismatch', bad: (m, p) => !norm(m.allow.pay_to).includes(p.to), actual: (p) => p.to },
+  { field: 'network', code: 'network-mismatch', proposed: true, valid: (v) => typeof v === 'string' && /^[-a-z0-9]{3,8}:[-_a-zA-Z0-9]{1,32}$/.test(v), bad: (m, p) => m.network !== p.network, actual: (p) => p.network },
+  { field: 'asset', code: 'asset-mismatch', proposed: true, valid: isAddr, bad: (m, p) => norm(m.asset) !== p.asset, actual: (p) => p.asset },
+  { field: 'not_before', code: 'grant-not-yet-valid', proposed: true, valid: isTime, bad: (m, p) => p.time < m.not_before, actual: (p) => p.time },
+  { field: 'expires_at', code: 'grant-expired', valid: isTime, bad: (m, p) => p.time >= m.expires_at, actual: (p) => p.time },
+  { field: 'per_payment_max', code: 'scope-exceeded', valid: (v) => typeof v === 'string' && /^(0|[1-9][0-9]*)$/.test(v), bad: (m, p) => BigInt(p.amount) > BigInt(m.per_payment_max), actual: (p) => p.amount, currency: (p) => p.asset },
+  { field: 'allow.pay_to', code: 'audience-mismatch', valid: (v) => Array.isArray(v) && v.every(isAddr), bad: (m, p) => !norm(m.allow.pay_to).includes(p.to), actual: (p) => p.to },
 ];
+const KNOWN = new Set(['v', ...CHECKS.map((k) => k.field)]);
+const leaves = (o, pre = '') => Object.entries(o).flatMap(([k, v]) => (v && typeof v === 'object' && !Array.isArray(v) ? leaves(v, `${pre}${k}.`) : [`${pre}${k}`]));
+
+// in_scope, mismatch (the violated checks) or unchecked (why). Decided from the mandate and the payment event, not from a delta.
+function judge(m, p) {
+  if (p.unchecked) return { verdict: 'unchecked', cause: 'payment_event', why: `payment event not determined: ${p.unchecked}` };
+  const unknown = leaves(m).filter((f) => !KNOWN.has(f));
+  if (unknown.length) return { verdict: 'unchecked', cause: 'no_predicate', why: `no predicate for ${unknown.join(', ')}` };
+  const invalid = CHECKS.filter((k) => !k.valid(at(m, k.field))).map((k) => k.field);
+  if (invalid.length) return { verdict: 'unchecked', cause: 'invalid_value', why: `not a valid value for its predicate: ${invalid.join(', ')}` };
+  const violated = CHECKS.filter((k) => k.bad(m, p));
+  return violated.length ? { verdict: 'mismatch', violated } : { verdict: 'in_scope' };
+}
 
 function record(check, m, p, iat, verbatim = false) {
   const raw = at(m, check.field);
@@ -76,14 +97,16 @@ function record(check, m, p, iat, verbatim = false) {
   return { reason: check.code, tier: 1, evidence: { delta: [entry] }, iat };
 }
 
+const facts = (p) => ({ network: p.network, asset: p.asset, payer: p.payer, to: p.to, amount: p.amount, block_time: p.time });
 const cases = read('./input/cases.json');
 const records = [], proposed = [], inScope = [], pitfalls = [];
 cases.forEach((c, index) => {
-  const p = payment(c.tx);
+  const p = payment(c.tx), j = judge(c.mandate, p);
+  if (j.verdict === 'unchecked') throw new Error(`${c.name}: ${j.why}`); // every case is a recorded payment with a valid mandate
   if (!(c.filed_at > p.time)) throw new Error(`${c.name}: the dispute must be filed after the payment (Step 5 item 4)`);
-  const violated = CHECKS.filter((k) => k.bad(c.mandate, p));
+  const violated = j.violated ?? [];
   if (violated.length > 1) throw new Error(`${c.name}: more than one constraint violated; each case tests one`);
-  const base = { index, name: c.name, tx: c.tx, payment: { network: p.network, asset: p.asset, payer: p.payer, to: p.to, amount: p.amount, block_time: p.time } };
+  const base = { index, name: c.name, tx: c.tx, payment: facts(p) };
 
   // Pitfall 1: comparing addresses as exact strings. A mandate in EIP-55 mixed case then "violates" constraints it satisfies.
   const exact = CHECKS.filter((k) => (k.field === 'asset' ? c.mandate.asset !== p.asset : k.field === 'allow.pay_to' ? !c.mandate.allow.pay_to.includes(p.to) : false));
@@ -110,15 +133,29 @@ cases.forEach((c, index) => {
   (k.proposed ? proposed : records).push(out);
 });
 
+// ---- fixtures (not on chain): a recorded receipt with `add_logs` appended, and/or a changed mandate. No record comes out of them.
+const fixtureInput = read('./input/fixtures.json');
+const fixtures = fixtureInput.map((f, index) => {
+  const added = f.add_logs ?? [], p = payment(f.tx, added), j = judge(f.mandate, p);
+  if (j.verdict !== f.expect.verdict || j.cause !== f.expect.cause) throw new Error(`${f.name}: expected ${f.expect.verdict} ${f.expect.cause ?? ''}, got ${j.verdict} ${j.why ?? ''}`);
+  if (j.verdict === 'mismatch') throw new Error(`${f.name}: a fixture must not produce a record`);
+  const out = { index, name: f.name, tx: f.tx, added_logs: added.length, verdict: j.verdict };
+  if (j.why) return { ...out, cause: j.cause, why: j.why };
+  // added logs must not change the selected event
+  if (jcs(facts(p)) !== jcs(facts(payment(f.tx)))) throw new Error(`${f.name}: the added logs changed the selected payment event`);
+  return { ...out, payment: facts(p), same_event_as_recorded_receipt: true };
+});
+
 const out = {
   spec: 'ext-disputes.md section 5.6 canonical field set as used by vectors/solana-iussum (reason, tier, evidence.delta, iat; JCS; SHA-256 base64url)',
   network,
-  inputs: { 'input/cases.json': cases.length, 'input/receipts': [...new Set(cases.map((c) => c.tx))].length, 'input/chain-id.json': network },
-  counts: { cases: cases.length, records: records.length, proposed_code_records: proposed.length, in_scope: inScope.length, pitfalls: pitfalls.length, jcs_cases_reproduced_by_make_mjs: jcsCases.length },
+  inputs: { 'input/cases.json': cases.length, 'input/receipts': [...new Set(cases.map((c) => c.tx))].length, 'input/chain-id.json': network, 'input/fixtures.json': fixtureInput.length },
+  counts: { cases: cases.length, records: records.length, proposed_code_records: proposed.length, in_scope: inScope.length, pitfalls: pitfalls.length, fixtures: fixtures.length, jcs_cases_reproduced_by_make_mjs: jcsCases.length },
   records,
   proposed_code_records: proposed,
   in_scope: inScope,
   pitfalls,
+  fixtures,
 };
 if (records.length + proposed.length + inScope.length !== cases.length) throw new Error('accounting');
 writeFileSync(here('./records.json'), `${JSON.stringify(out, null, 2)}\n`);
